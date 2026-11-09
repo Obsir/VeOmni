@@ -156,11 +156,27 @@ def _compute_wan_seqlens(micro_batch: Dict[str, "torch.Tensor"]) -> List[int]:
 
 def _compute_minimax_h3_seqlens(micro_batch: Dict[str, Any]) -> tuple[List[int], List[int]]:
     """Return per-sample valid main and text-refiner lengths for offline H3."""
+    packed = micro_batch.get("packed")
+    if packed is None:
+        return [], []
+    if isinstance(packed, dict):
+        packed = [packed]
+    if not isinstance(packed, (list, tuple)):
+        return [], []
     seq_lens, text_lens = [], []
-    for item in micro_batch.get("packed", []):
-        # The position arrays omit legacy tail padding in cached packed layouts.
-        seq_lens.append(sum(item[key].numel() for key in ("text_pos", "img_pos", "audio_pos")))
-        text_lens.append(int(item["text_len"]))
+    for item in packed:
+        if not isinstance(item, dict):
+            return [], []
+        seq_len, text_len = item.get("seq_len"), item.get("text_len")
+        positions = [item.get(key) for key in ("text_pos", "img_pos", "audio_pos")]
+        if any(value is None for value in (seq_len, text_len, *positions)):
+            return [], []
+        seq_len, text_len = int(seq_len), int(text_len)
+        used_len = sum(position.numel() for position in positions)
+        if used_len <= 0 or used_len > seq_len or text_len < 0 or text_len > used_len:
+            return [], []
+        seq_lens.append(used_len)
+        text_lens.append(text_len)
     return seq_lens, text_lens
 
 
@@ -258,6 +274,9 @@ class EnvironMeter:
         self.batch_ds_idx = []
         self.images_seqlens = []
         self.h3_text_seqlens = []
+        self._h3_lengths_complete = True
+        self._h3_missing_packed_warned = False
+        self._h3_incomplete_global_warned = False
         self._batch_token_stats = []
         self._batch_token_stats_complete = True
 
@@ -313,9 +332,18 @@ class EnvironMeter:
                 if self.enable_multisource:
                     self.batch_ds_idx.extend(_get_multisource_ds_idx(micro_batch))
         elif self.config.model_type == "MiniMaxH3DiTModel":
-            seq_lens, text_lens = _compute_minimax_h3_seqlens(micro_batch)
-            self.batch_seqlens.extend(seq_lens)
-            self.h3_text_seqlens.extend(text_lens)
+            for sample in micro_batch if isinstance(micro_batch, list) else [micro_batch]:
+                seq_lens, text_lens = _compute_minimax_h3_seqlens(sample)
+                if not seq_lens:
+                    self._h3_lengths_complete = False
+                    if not self._h3_missing_packed_warned:
+                        logger.warning_rank0(
+                            "MiniMax-H3 FLOPs are unavailable with missing or invalid packed sequence lengths; "
+                            "for online training, encoding may construct them after the meter runs."
+                        )
+                        self._h3_missing_packed_warned = True
+                self.batch_seqlens.extend(seq_lens)
+                self.h3_text_seqlens.extend(text_lens)
         else:  # dit diffusers model
             self.batch_seqlens.extend(_compute_wan_seqlens(micro_batch))
 
@@ -389,6 +417,10 @@ class EnvironMeter:
     ) -> Dict[str, Any]:
         flops_kwargs = {}
         if self.config.model_type == "MiniMaxH3DiTModel":
+            if not self._h3_lengths_complete:
+                # A partial batch would silently underestimate this step.
+                self.batch_seqlens = []
+                self.h3_text_seqlens = []
             flops_kwargs["h3_text_seqlens"] = self.h3_text_seqlens
         if self.images_seqlens:
             flops_kwargs["images_seqlens"] = self.images_seqlens
@@ -411,11 +443,20 @@ class EnvironMeter:
         )
         if lora_flops_unavailable:
             flops_achieved = 0
-        flops_achieved, batch_tokens, real_global_batch_size = all_reduce(
-            (flops_achieved, sum(self.batch_seqlens), len(self.batch_seqlens)),
-            op="sum",
-            group=self.parallel_state.dp_group,
-        )
+        reduced = (flops_achieved, sum(self.batch_seqlens), len(self.batch_seqlens))
+        if self.config.model_type == "MiniMaxH3DiTModel":
+            reduced += (int(self._h3_lengths_complete),)
+        reduced = all_reduce(reduced, op="sum", group=self.parallel_state.dp_group)
+        flops_achieved, batch_tokens, real_global_batch_size = reduced[:3]
+        if self.config.model_type == "MiniMaxH3DiTModel":
+            if reduced[3] != dist.get_world_size(group=self.parallel_state.dp_group):
+                # Do not publish a partial data-parallel estimate when any rank lacks metadata.
+                flops_achieved, batch_tokens, real_global_batch_size = 0, 0, 0
+                if not self._h3_incomplete_global_warned:
+                    logger.warning_rank0(
+                        "MiniMax-H3 FLOPs are unavailable: packed lengths are incomplete across ranks."
+                    )
+                    self._h3_incomplete_global_warned = True
         flops_promised = flops_promised * self.world_size
         mfu = flops_achieved / flops_promised if flops_promised else 0
 
@@ -495,6 +536,7 @@ class EnvironMeter:
         self.batch_ds_idx = []
         self.images_seqlens = []
         self.h3_text_seqlens = []
+        self._h3_lengths_complete = True
         self._batch_token_stats = []
         self._batch_token_stats_complete = True
 
