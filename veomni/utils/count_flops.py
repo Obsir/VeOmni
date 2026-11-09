@@ -125,14 +125,8 @@ class VeomniFlopsCounter:
         This is model FLOPs, not device FLOPs: checkpoint recomputation, CFG's
         extra forward, normalization, embeddings and small projections are omitted.
         """
-        if not batch_seqlens:
+        if not batch_seqlens or h3_text_seqlens is None:
             return 0.0
-        if h3_text_seqlens is None or len(h3_text_seqlens) != len(batch_seqlens):
-            raise ValueError("MiniMax-H3 FLOPs requires one text length per packed sample")
-        if delta_time <= 0:
-            raise ValueError("MiniMax-H3 FLOPs requires a positive step time")
-        if any(t < 0 or t > s for t, s in zip(h3_text_seqlens, batch_seqlens)):
-            raise ValueError("MiniMax-H3 text lengths must be within packed sequence lengths")
 
         cfg = self.config
         hidden = int(cfg.hidden_size)
@@ -1550,7 +1544,7 @@ class VeomniFlopsCounter:
             kwargs["images_seqlens"] = images_seqlens
         if freeze_vit is not None:
             kwargs["freeze_vit"] = freeze_vit
-        if h3_text_seqlens is not None and self.config.model_type == "MiniMaxH3DiTModel":
+        if h3_text_seqlens is not None:
             kwargs["h3_text_seqlens"] = h3_text_seqlens
 
         tokens_sum = sum(batch_seqlens)

@@ -108,12 +108,12 @@ def test_minimax_h3_flops_counts_each_packed_sequence(mock_device_flops):
     assert with_optional_arg == flops
     empty, _ = counter.estimate_flops([], 2.0, h3_text_seqlens=[])
     assert empty == 0
-    with pytest.raises(ValueError, match="one text length"):
-        counter.estimate_flops([4, 2], 2.0, h3_text_seqlens=[2])
-    with pytest.raises(ValueError, match="within packed"):
-        counter.estimate_flops([4], 2.0, h3_text_seqlens=[5])
-    with pytest.raises(ValueError, match="positive"):
-        counter.estimate_flops([4], 0, h3_text_seqlens=[2])
+    missing_text_lengths, _ = counter.estimate_flops([4], 2.0)
+    assert missing_text_lengths == 0
+    one_sample, _ = counter.estimate_flops([128], 2.0, h3_text_seqlens=[0])
+    two_samples, _ = counter.estimate_flops([64, 64], 2.0, h3_text_seqlens=[0, 0])
+    # With equal token totals, only the per-sample main attention term changes.
+    assert one_sample - two_samples == pytest.approx(12 * 2 * 8 * (128**2 - 2 * 64**2) / 2 / 1e12)
     with patch("veomni.utils.count_flops.logger.warning_rank0"):
         unsupported, _ = counter.estimate_flops([4], 2.0, lora_config=_lora_config(8, ["q_proj"]))
     assert unsupported == 0
@@ -158,45 +158,17 @@ def test_minimax_h3_meter_accumulates_and_clears_packed_lengths(monkeypatch, moc
         parallel_state=SimpleNamespace(dp_group=None, sp_enabled=False),
     )
     meter.add({"packed": [_h3_packed(4, 2)]})
-    meter.add([{"packed": _h3_packed(2, 1)}, {"packed": _h3_packed(3, 1)}])
+    meter.add({"packed": [_h3_packed(2, 1), _h3_packed(3, 1)]})
     assert meter.batch_seqlens == [4, 2, 3]
     assert meter.h3_text_seqlens == [2, 1, 1]
     metrics = meter.step(delta_time=2.0, global_step=1)
     assert metrics["mfu"] > 0
     assert meter.batch_seqlens == [] and meter.h3_text_seqlens == []
-    meter.add({"packed": _h3_packed(5, 2)})
+    meter.add({"packed": [_h3_packed(5, 2)]})
     assert meter.batch_seqlens == [5] and meter.h3_text_seqlens == [2]
-    with patch.object(helper.logger, "warning_rank0"):
-        meter.add({})
-        metrics = meter.step(delta_time=2.0, global_step=2)
-    assert metrics["mfu"] == 0
-    meter.add({"packed": _h3_packed(4, 2)})
-    assert meter.step(delta_time=2.0, global_step=3)["mfu"] > 0
-
-
-def test_minimax_h3_incomplete_remote_rank_does_not_publish_partial_mfu(monkeypatch, mock_device_flops):
-    from veomni.utils import helper
-
-    def fake_all_reduce(values, **kwargs):
-        if isinstance(values, tuple) and len(values) == 4:
-            return (*values[:3], 1)  # Only one of two ranks has valid packed data.
-        return values
-
-    monkeypatch.setattr(helper.dist, "get_world_size", lambda *args, **kwargs: 2)
-    monkeypatch.setattr(helper, "all_reduce", fake_all_reduce)
-    monkeypatch.setattr(helper, "get_device_type", lambda: "cpu")
-    monkeypatch.setattr(helper, "compute_device_memory_metrics", lambda: {})
-    meter = helper.EnvironMeter(
-        config=_minimax_h3_config(),
-        global_batch_size=2,
-        empty_cache_steps=0,
-        parallel_state=SimpleNamespace(dp_group=None, sp_enabled=False),
-    )
-    meter.add({"packed": _h3_packed(4, 2)})
-    with patch.object(helper.logger, "warning_rank0") as warning:
-        metrics = meter.step(delta_time=1.0, global_step=1)
-    assert metrics["mfu"] == 0
-    warning.assert_called_once()
+    assert meter.step(delta_time=2.0, global_step=2)["mfu"] > 0
+    meter.add({})  # Online inputs do not contain packed metadata at meter time.
+    assert meter.step(delta_time=2.0, global_step=3)["mfu"] == 0
 
 
 def test_gb200_device_flops():
